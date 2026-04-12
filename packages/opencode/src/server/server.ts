@@ -13,6 +13,7 @@ import { ProviderID } from "../provider/schema"
 import { WorkspaceRouterMiddleware } from "./router"
 import { errors } from "./error"
 import { GlobalRoutes } from "./routes/global"
+import { CopilotServerRoutes } from "./routes/copilot"
 import { MDNS } from "./mdns"
 import { lazy } from "@/util/lazy"
 import { errorHandler } from "./middleware"
@@ -98,6 +99,7 @@ export namespace Server {
         if (skipCompress(c.req.path, c.req.method)) return next()
         return zipped(c, next)
       })
+      .route("/v1", CopilotServerRoutes())
       .route("/global", GlobalRoutes())
       .put(
         "/auth/:providerID",
