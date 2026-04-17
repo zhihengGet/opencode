@@ -428,29 +428,31 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
                     type: z.literal("output_text"),
                     text: z.string(),
                     logprobs: LOGPROBS_SCHEMA.nullish(),
-                    annotations: z.array(
-                      z.discriminatedUnion("type", [
-                        z.object({
-                          type: z.literal("url_citation"),
-                          start_index: z.number(),
-                          end_index: z.number(),
-                          url: z.string(),
-                          title: z.string(),
-                        }),
-                        z.object({
-                          type: z.literal("file_citation"),
-                          file_id: z.string(),
-                          filename: z.string().nullish(),
-                          index: z.number().nullish(),
-                          start_index: z.number().nullish(),
-                          end_index: z.number().nullish(),
-                          quote: z.string().nullish(),
-                        }),
-                        z.object({
-                          type: z.literal("container_file_citation"),
-                        }),
-                      ]),
-                    ),
+                    annotations: z
+                      .array(
+                        z.discriminatedUnion("type", [
+                          z.object({
+                            type: z.literal("url_citation"),
+                            start_index: z.number(),
+                            end_index: z.number(),
+                            url: z.string(),
+                            title: z.string(),
+                          }),
+                          z.object({
+                            type: z.literal("file_citation"),
+                            file_id: z.string(),
+                            filename: z.string().nullish(),
+                            index: z.number().nullish(),
+                            start_index: z.number().nullish(),
+                            end_index: z.number().nullish(),
+                            quote: z.string().nullish(),
+                          }),
+                          z.object({
+                            type: z.literal("container_file_citation"),
+                          }),
+                        ]),
+                      )
+                      .nullish(),
                   }),
                 ),
               }),
@@ -588,7 +590,7 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
               },
             })
 
-            for (const annotation of contentPart.annotations) {
+            for (const annotation of contentPart.annotations ?? []) {
               if (annotation.type === "url_citation") {
                 content.push({
                   type: "source",
@@ -715,7 +717,7 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
             toolCallId: part.id,
             toolName: "code_interpreter",
             result: {
-              outputs: part.outputs,
+              outputs: part.outputs ?? [],
             } satisfies z.infer<typeof codeInterpreterOutputSchema>,
           })
           break
@@ -1072,7 +1074,7 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
                   toolCallId: value.item.id,
                   toolName: "code_interpreter",
                   result: {
-                    outputs: value.item.outputs,
+                    outputs: value.item.outputs ?? [],
                   } satisfies z.infer<typeof codeInterpreterOutputSchema>,
                 })
               } else if (value.item.type === "image_generation_call") {

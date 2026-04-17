@@ -19,11 +19,7 @@ cd packages/opencode
 bun run src/copilot-server.ts
 ```
 
-Default port: `4096`. Use `PORT` env var to change:
-
-```bash
-PORT=5001 bun run src/copilot-server.ts
-```
+Default port: `4096`
 
 ## Endpoints
 
@@ -46,15 +42,12 @@ Only these models are allowed:
 
 ## Authentication
 
-The server uses OAuth tokens stored by opencode in:
+The server **always uses OAuth tokens stored by opencode**. Any `Authorization` header sent by the client is ignored.
+
+Auth is loaded from:
 
 - Windows: `%APPDATA%/opencode/auth.json` or `%LOCALAPPDATA%/.local/share/opencode/auth.json`
 - macOS/Linux: `~/.local/share/opencode/auth.json`
-
-### Token Precedence
-
-1. User-provided Bearer token (if valid and not "placeholder")
-2. Stored token from opencode auth
 
 ### Using with litellm
 
@@ -62,22 +55,19 @@ The server uses OAuth tokens stored by opencode in:
 model_list:
   - model_name: gpt-4o
     litellm_params:
-      api_base: http://127.0.0.1:5001/v1
+      api_base: http://127.0.0.1:4096/v1
       model: openai/gpt-4o
+      api_key: any-value-here # ignored
 ```
+
+Note: The `api_key` value is ignored - the server uses opencode's stored token.
 
 ### Using with curl
 
 ```bash
-# Using stored token (no auth header needed)
-curl -X POST "http://127.0.0.1:5001/v1/chat/completions" \
+# Auth header is ignored - uses opencode stored token
+curl -X POST "http://127.0.0.1:4096/v1/chat/completions" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
-
-# With user-provided token
-curl -X POST "http://127.0.0.1:5001/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_GITHUB_TOKEN" \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
 ```
 

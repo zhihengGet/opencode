@@ -14,7 +14,7 @@ export const codeInterpreterOutputSchema = z.object({
         z.object({ type: z.literal("image"), url: z.string() }),
       ]),
     )
-    .nullish(),
+    .nullable(),
 })
 
 export const codeInterpreterArgsSchema = z.object({
