@@ -6,6 +6,22 @@ import path from "path"
 import os from "os"
 import crypto from "crypto"
 
+// Simple color codes
+const R = "\x1b[31m" // red - errors
+const G = "\x1b[32m" // green - success
+const Y = "\x1b[33m" // yellow - warnings
+const B = "\x1b[36m" // cyan - info
+const X = "\x1b[0m" // reset
+
+const log = {
+  info: (msg: string, ...args: any[]) => console.log(`${B}${msg}${X}`, ...args),
+  ok: (msg: string, ...args: any[]) => console.log(`${G}${msg}${X}`, ...args),
+  warn: (msg: string, ...args: any[]) => console.log(`${Y}${msg}${X}`, ...args),
+  err: (msg: string, ...args: any[]) => console.log(`${R}${msg}${X}`, ...args),
+  req: (msg: string, ...args: any[]) => console.log(`${B}[REQ]${X}`, msg, ...args),
+  res: (msg: string, ...args: any[]) => console.log(`${G}[RES]${X}`, msg, ...args),
+}
+
 const app = new Hono()
 
 const dataDir = process.env.OPENCODE_DATA || path.join(os.homedir(), "AppData", "Roaming", "opencode")
@@ -35,7 +51,7 @@ function loadAuth() {
 }
 
 let allAuth = loadAuth()
-console.log(`Initial auth keys: ${Object.keys(allAuth).join(", ")}`)
+log.info(`Initial auth keys: ${Object.keys(allAuth).join(", ")}`)
 
 setInterval(() => {
   allAuth = loadAuth()
@@ -88,23 +104,26 @@ app.get("/v1/models", async (c) => {
 
 // === CHAT COMPLETIONS ===
 app.post("/v1/chat/completions", async (c) => {
-  const reqId = crypto.randomUUID()
-  const authHeader = c.req.header("Authorization")
+  const reqId = crypto.randomUUID().slice(0, 8)
 
-  console.log(`[${reqId}] POST /v1/chat/completions, auth: ${authHeader ? "provided but ignored" : "none"}`)
+  const body = await c.req.json().catch(() => ({}))
+  const model = (body.model || "").trim()
 
-  // Always use stored token from opencode - ignore user authorization header
+  log.req(`${reqId} POST /v1/chat/completions model=${model}`)
+
   const stored = allAuth["github-copilot"]
   let token = stored?.access
 
   if (!token) {
+    log.err(`${reqId} No stored token found`)
     return c.json({ error: { message: "No auth configured", code: 401 } }, 401)
   }
 
-  const body = await c.req.json().catch(() => ({}))
-  const model = body.model || ""
+  log.info(`${reqId} messages=${body.messages?.length || 0}`)
+  log.info(`${reqId} request:`, JSON.stringify(body))
 
   if (!isAllowedModel(model)) {
+    log.err(`${reqId} Model not allowed: ${model}`)
     return c.json(
       {
         error: {
@@ -121,6 +140,8 @@ app.post("/v1/chat/completions", async (c) => {
     ? `https://copilot-api.${stored.enterpriseUrl.replace(/^https?:\/\//, "").replace(/\/$/, "")}`
     : "https://api.githubcopilot.com"
 
+  log.info(`${reqId} proxying to: ${base}/chat/completions`)
+
   try {
     const response = await fetch(`${base}/chat/completions`, {
       method: "POST",
@@ -132,33 +153,65 @@ app.post("/v1/chat/completions", async (c) => {
       body: JSON.stringify(body),
     })
 
+    log.info(`${reqId} upstream status: ${response.status}`)
+
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}))
+      log.err(`${reqId} upstream failed: ${response.status}`)
+      return c.json({ error: data, status: response.status })
+    }
+
+    if (body.stream) {
+      c.header("Content-Type", "text/event-stream")
+      c.header("Cache-Control", "no-cache")
+      c.header("Connection", "keep-alive")
+      return c.body(response.body)
+    }
+
     const data = await response.json()
-    console.log(`[${reqId}] OK: ${response.status}`)
+    log.res(`${reqId} response:`, JSON.stringify(data))
     return c.json(data)
-  } catch (e) {
-    return c.json({ error: { message: String(e) } }, 500)
+  } catch (e: any) {
+    log.err(`${reqId} fetch error: ${e?.message || e}`)
+    log.err(`${reqId} stack: ${e?.stack || "none"}`)
+    return c.json({ error: { message: e?.message || String(e) } }, 500)
   }
 })
 
 // === RESPONSES API ===
+function cleanNullValues(obj: any): any {
+  if (obj === null) return undefined
+  if (Array.isArray(obj)) return obj.map(cleanNullValues)
+  if (typeof obj === "object" && obj !== null) {
+    const result: any = {}
+    for (const key of Object.keys(obj)) {
+      result[key] = cleanNullValues(obj[key])
+    }
+    return result
+  }
+  return obj
+}
+
 app.post("/v1/responses", async (c) => {
-  const reqId = crypto.randomUUID()
-  const authHeader = c.req.header("Authorization")
+  const reqId = crypto.randomUUID().slice(0, 8)
 
-  console.log(`[${reqId}] POST /v1/responses, auth: ${authHeader ? "provided but ignored" : "none"}`)
+  const body = await c.req.json().catch(() => ({}))
+  const model = (body.model || "").trim()
 
-  // Always use stored token - ignore user authorization
+  log.req(`${reqId} POST /v1/responses model=${model}`)
+
   const stored = allAuth["github-copilot"]
   let token = stored?.access
 
   if (!token) {
+    log.err(`${reqId} No stored token`)
     return c.json({ error: { message: "No auth configured", code: 401 } }, 401)
   }
 
-  const body = await c.req.json().catch(() => ({}))
-  const model = body.model || ""
+  log.info(`${reqId} request:`, JSON.stringify(body))
 
   if (!isAllowedModel(model)) {
+    log.err(`${reqId} Model not allowed: ${model}`)
     return c.json(
       {
         error: {
@@ -187,31 +240,37 @@ app.post("/v1/responses", async (c) => {
     })
 
     const data = await response.json()
-    return c.json(data)
-  } catch (e) {
-    return c.json({ error: { message: String(e) } }, 500)
+    log.res(`${reqId} response:`, JSON.stringify(data))
+
+    const cleaned = cleanNullValues(data)
+    return c.json(cleaned)
+  } catch (e: any) {
+    log.err(`${reqId} error: ${e?.message || e}`)
+    return c.json({ error: { message: e?.message || String(e) } }, 500)
   }
 })
 
 // === COMPLETIONS ===
 app.post("/v1/completions", async (c) => {
-  const reqId = crypto.randomUUID()
-  const authHeader = c.req.header("Authorization")
+  const reqId = crypto.randomUUID().slice(0, 8)
 
-  console.log(`[${reqId}] POST /v1/completions, auth: ${authHeader ? "provided but ignored" : "none"}`)
+  const body = await c.req.json().catch(() => ({}))
+  const model = (body.model || "").trim()
 
-  // Always use stored token - ignore user authorization
+  log.req(`${reqId} POST /v1/completions model=${model}`)
+
   const stored = allAuth["github-copilot"]
   let token = stored?.access
 
   if (!token) {
+    log.err(`${reqId} No stored token`)
     return c.json({ error: { message: "No auth configured", code: 401 } }, 401)
   }
 
-  const body = await c.req.json()
-  const model = body.model || ""
+  log.info(`${reqId} request:`, JSON.stringify(body))
 
   if (!isAllowedModel(model)) {
+    log.err(`${reqId} Model not allowed: ${model}`)
     return c.json(
       {
         error: {
@@ -228,17 +287,24 @@ app.post("/v1/completions", async (c) => {
     ? `https://copilot-api.${stored.enterpriseUrl.replace(/^https?:\/\//, "").replace(/\/$/, "")}`
     : "https://api.githubcopilot.com"
 
-  const response = await fetch(`${base}/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(body),
-  })
+  try {
+    const response = await fetch(`${base}/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+        "User-Agent": "opencode-copilot-server/1.0",
+      },
+      body: JSON.stringify(body),
+    })
 
-  const data = await response.json()
-  return c.json(data)
+    const data = await response.json()
+    log.res(`${reqId} response:`, JSON.stringify(data))
+    return c.json(data)
+  } catch (e: any) {
+    log.err(`${reqId} error: ${e?.message || e}`)
+    return c.json({ error: { message: e?.message || String(e) } }, 500)
+  }
 })
 
 const port = parseInt(process.env.PORT || "4096")
