@@ -156,8 +156,9 @@ app.post("/v1/chat/completions", async (c) => {
     log.info(`${reqId} upstream status: ${response.status}`)
 
     if (!response.ok) {
-      const data = await response.json().catch(() => ({}))
-      log.err(`${reqId} upstream failed: ${response.status}`)
+      const text = await response.text().catch(() => "")
+      const data = text ? JSON.parse(text) : {}
+      log.err(`${reqId} upstream failed: ${response.status}`, text.slice(0, 500))
       return c.json({ error: data, status: response.status })
     }
 
