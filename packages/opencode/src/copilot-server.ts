@@ -118,8 +118,10 @@ app.post("/v1/chat/completions", async (c) => {
     return c.json({ error: { message: "No auth configured", code: 401 } }, 401)
   }
 
-  log.info(`${reqId} messages=${body.messages?.length || 0}`)
-  log.info(`${reqId} request:`, JSON.stringify(body))
+  log.info(`${reqId} messages=${body.messages?.length || 0} tools=${body.tools?.length || 0} stream=${body.stream || false}`)
+  const reqBodyStr = JSON.stringify(body)
+  log.info(`${reqId} request (${reqBodyStr.length} bytes):`)
+  log.info(reqBodyStr.slice(0, 10000))
 
   if (!isAllowedModel(model)) {
     log.err(`${reqId} Model not allowed: ${model}`)
@@ -175,7 +177,26 @@ app.post("/v1/chat/completions", async (c) => {
       c.header("Content-Type", "text/event-stream")
       c.header("Cache-Control", "no-cache")
       c.header("Connection", "keep-alive")
-      return c.body(response.body)
+
+      const reader = response.body!.getReader()
+      let chunkCount = 0
+      const stream = new ReadableStream({
+        async pull(controller) {
+          const { done, value } = await reader.read()
+          if (done) {
+            log.info(`${reqId} stream complete (${chunkCount} chunks)`)
+            controller.close()
+            return
+          }
+          chunkCount++
+          controller.enqueue(value)
+        },
+        cancel() {
+          reader.releaseLock()
+        },
+      })
+
+      return c.body(stream)
     }
 
     const data = await response.json()
