@@ -252,6 +252,11 @@ app.post("/v1/responses", async (c) => {
     const data = await response.json()
     log.res(`${reqId} response:`, JSON.stringify(data))
 
+    const usage = data.usage || data.response?.usage
+    if (usage?.output_tokens_details?.reasoning_tokens) {
+      log.info(`${reqId} reasoning_tokens: ${usage.output_tokens_details.reasoning_tokens}`)
+    }
+
     const cleaned = cleanNullValues(data)
     return c.json(cleaned)
   } catch (e: any) {
