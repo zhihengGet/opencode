@@ -121,7 +121,7 @@ app.post("/v1/chat/completions", async (c) => {
   log.info(`${reqId} messages=${body.messages?.length || 0} tools=${body.tools?.length || 0} stream=${body.stream || false}`)
   const reqBodyStr = JSON.stringify(body, null, 2)
   log.info(`${reqId} request (${reqBodyStr.length} bytes):`)
-  log.info("\n" + reqBodyStr.slice(0, 10000))
+  log.info("\n" + reqBodyStr)
 
   if (!isAllowedModel(model)) {
     log.err(`${reqId} Model not allowed: ${model}`)
@@ -200,7 +200,7 @@ app.post("/v1/chat/completions", async (c) => {
     }
 
     const data = await response.json()
-    log.res(`${reqId} response:\n` + JSON.stringify(data, null, 2).slice(0, 10000))
+    log.res(`${reqId} response:\n` + JSON.stringify(data, null, 2))
     return c.json(data)
   } catch (e: any) {
     log.err(`${reqId} fetch error: ${e?.message || e}`)
@@ -239,7 +239,7 @@ app.post("/v1/responses", async (c) => {
     return c.json({ error: { message: "No auth configured", code: 401 } }, 401)
   }
 
-  log.info(`${reqId} request:\n` + JSON.stringify(body, null, 2).slice(0, 10000))
+  log.info(`${reqId} request:\n` + JSON.stringify(body, null, 2))
 
   if (!isAllowedModel(model)) {
     log.err(`${reqId} Model not allowed: ${model}`)
@@ -271,7 +271,7 @@ app.post("/v1/responses", async (c) => {
     })
 
     const data = await response.json()
-    log.res(`${reqId} response:\n` + JSON.stringify(data, null, 2).slice(0, 10000))
+    log.res(`${reqId} response:\n` + JSON.stringify(data, null, 2))
 
     const usage = data.usage || data.response?.usage
     if (usage?.output_tokens_details?.reasoning_tokens) {
@@ -303,7 +303,7 @@ app.post("/v1/completions", async (c) => {
     return c.json({ error: { message: "No auth configured", code: 401 } }, 401)
   }
 
-  log.info(`${reqId} request:\n` + JSON.stringify(body, null, 2).slice(0, 10000))
+  log.info(`${reqId} request:\n` + JSON.stringify(body, null, 2))
 
   if (!isAllowedModel(model)) {
     log.err(`${reqId} Model not allowed: ${model}`)
@@ -335,7 +335,7 @@ app.post("/v1/completions", async (c) => {
     })
 
     const data = await response.json()
-    log.res(`${reqId} response:\n` + JSON.stringify(data, null, 2).slice(0, 10000))
+    log.res(`${reqId} response:\n` + JSON.stringify(data, null, 2))
     return c.json(data)
   } catch (e: any) {
     log.err(`${reqId} error: ${e?.message || e}`)
