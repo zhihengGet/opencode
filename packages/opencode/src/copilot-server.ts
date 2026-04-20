@@ -142,6 +142,16 @@ app.post("/v1/chat/completions", async (c) => {
 
   log.info(`${reqId} proxying to: ${base}/chat/completions`)
 
+  if (body.response_format?.type === "json_object" && body.messages?.length > 0) {
+    const hasJsonKeyword = body.messages.some((m: any) =>
+      JSON.stringify(m.content || "").toLowerCase().includes("json"),
+    )
+    if (!hasJsonKeyword) {
+      body.messages = [{ role: "system", content: "Respond with valid JSON." }, ...body.messages]
+      log.info(`${reqId} Added JSON system message for json_object response_format`)
+    }
+  }
+
   try {
     const response = await fetch(`${base}/chat/completions`, {
       method: "POST",
