@@ -26,22 +26,21 @@ const app = new Hono()
 
 const dataDir = process.env.OPENCODE_DATA || path.join(os.homedir(), "AppData", "Roaming", "opencode")
 const authFile = path.join(dataDir, "auth.json")
-console.log(`Looking for auth in: ${authFile}`)
+// Auth file locations loaded silently
 
 const xdgData = process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share")
 const xdgAuthFile = path.join(xdgData, "opencode", "auth.json")
-console.log(`Also checking: ${xdgAuthFile}`)
 
 function loadAuth() {
   try {
     if (existsSync(authFile)) {
       const data = JSON.parse(readFileSync(authFile, "utf-8"))
-      console.log(`Loaded auth from ${authFile}: ${Object.keys(data).join(", ")}`)
+      log.ok(`Auth loaded from file: ${Object.keys(data).join(", ")}`)
       return data
     }
     if (existsSync(xdgAuthFile)) {
       const data = JSON.parse(readFileSync(xdgAuthFile, "utf-8"))
-      console.log(`Loaded auth from ${xdgAuthFile}: ${Object.keys(data).join(", ")}`)
+      log.ok(`Auth loaded from XDG: ${Object.keys(data).join(", ")}`)
       return data
     }
   } catch (e) {
