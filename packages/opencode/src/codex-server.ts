@@ -242,6 +242,7 @@ app.post("/v1/chat/completions", async (c) => {
   const model = modelName(body.model)
 
   log.info(`\n[${id}] POST /v1/chat/completions model=${model}`)
+  log.info(`[${id}] Request body keys: ${Object.keys(body).join(", ")}`)
 
   if (!allowed(model)) {
     log.err(`[${id}] model not allowed: ${model}`)
@@ -272,7 +273,38 @@ app.post("/v1/chat/completions", async (c) => {
     }
   }
 
+  // Transform standard OpenAI format to Codex format
+  const isCodexFormat = body.instructions !== undefined || (Array.isArray(body.input) && !body.messages)
+  let codexBody: Record<string, unknown>
+
+  if (isCodexFormat) {
+    codexBody = body
+  } else {
+    // Convert messages to Codex format
+    const msgs = Array.isArray(body.messages) ? body.messages : []
+    const systemMsg = msgs.find((m: any) => m?.role === "system")
+    const otherMsgs = msgs.filter((m: any) => m?.role !== "system")
+
+    codexBody = {
+      model: body.model,
+      instructions: systemMsg?.content || "You are a helpful assistant.",
+      input: otherMsgs.length > 0 ? otherMsgs : [{ role: "user", content: "" }],
+      store: false,
+      stream: body.stream !== false,
+    }
+
+    // Pass through other options
+    if (body.tools) codexBody.tools = body.tools
+    if (body.tool_choice) codexBody.tool_choice = body.tool_choice
+    if (body.response_format) codexBody.response_format = body.response_format
+    if (body.temperature !== undefined) codexBody.temperature = body.temperature
+    if (body.max_tokens !== undefined) codexBody.max_completion_tokens = body.max_tokens
+    if (body.top_p !== undefined) codexBody.top_p = body.top_p
+    if (body.reasoning_effort !== undefined) codexBody.reasoning_effort = body.reasoning_effort
+  }
+
   try {
+    log.info(`[${id}] Sending request to Codex API...`)
     const response = await fetch(endpoint, {
       method: "POST",
       headers: {
@@ -281,12 +313,16 @@ app.post("/v1/chat/completions", async (c) => {
         "User-Agent": "opencode-codex-server/1.0",
         ...(auth.accountId ? { "ChatGPT-Account-Id": auth.accountId } : {}),
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(codexBody),
     })
+
+    log.info(`[${id}] Response status: ${response.status}`)
+    log.info(`[${id}] Response content-type: ${response.headers.get("content-type")}`)
 
     if (!response.ok) {
       const data = await parseBody(response)
       log.err(`[${id}] upstream failed: ${response.status}`)
+      log.err(`[${id}] error: ${JSON.stringify(data)}`)
       return new Response(JSON.stringify({ error: data }), {
         status: response.status,
         headers: { "Content-Type": "application/json" },
@@ -296,7 +332,9 @@ app.post("/v1/chat/completions", async (c) => {
     const data = response.body
     if (body.stream === true && data) {
       const reader = data.getReader()
-      let count = 0
+      const decoder = new TextDecoder()
+      let buffer = ""
+      let chunkCount = 0
 
       c.header("Content-Type", "text/event-stream")
       c.header("Cache-Control", "no-cache")
@@ -304,16 +342,58 @@ app.post("/v1/chat/completions", async (c) => {
 
       return c.body(
         new ReadableStream({
-          async pull(controller) {
-            const { done, value } = await reader.read()
-            if (done) {
-              log.res(`[${id}] stream complete (${count} chunks)`)
-              controller.close()
-              return
-            }
+          start(controller) {
+            // Start reading in background
+            const pump = async () => {
+              try {
+                while (true) {
+                  const { done, value } = await reader.read()
+                  if (done) {
+                    log.res(`[${id}] stream complete (${chunkCount} chunks)`)
+                    controller.close()
+                    return
+                  }
 
-            count += 1
-            controller.enqueue(value)
+                  buffer += decoder.decode(value, { stream: true })
+                  const lines = buffer.split("\n")
+                  buffer = lines.pop() || ""
+
+                  for (const line of lines) {
+                    if (line.startsWith("data: ")) {
+                      const eventData = line.slice(6)
+                      if (eventData === "[DONE]") {
+                        controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"))
+                        continue
+                      }
+                      try {
+                        const parsed = JSON.parse(eventData)
+                        // Transform Codex format to OpenAI format
+                        if (parsed.type === "response.output_text.delta" && parsed.delta) {
+                          const openaiChunk = {
+                            id: `chatcmpl-${id}`,
+                            object: "chat.completion.chunk",
+                            created: Math.floor(Date.now() / 1000),
+                            model: body.model,
+                            choices: [{
+                              index: 0,
+                              delta: { content: parsed.delta },
+                              finish_reason: null,
+                            }],
+                          }
+                          const sse = `data: ${JSON.stringify(openaiChunk)}\n\n`
+                          controller.enqueue(new TextEncoder().encode(sse))
+                          chunkCount++
+                        }
+                      } catch {}
+                    }
+                  }
+                }
+              } catch (err) {
+                log.err(`[${id}] stream error: ${err}`)
+                controller.error(err)
+              }
+            }
+            pump()
           },
           cancel() {
             reader.releaseLock()
@@ -322,7 +402,110 @@ app.post("/v1/chat/completions", async (c) => {
       )
     }
 
-    const dataJson = cleanNullValues(await parseBody(response))
+    // Buffer streaming response for non-streaming client requests
+    if (!body.stream && data) {
+      log.info(`[${id}] Buffering streaming response for non-streaming request`)
+      const reader = data.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ""
+      let fullText = ""
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split("\n")
+        buffer = lines.pop() || ""
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const eventData = line.slice(6)
+            log.info(`[${id}] SSE chunk: ${eventData.slice(0, 100)}...`)
+            if (eventData === "[DONE]") continue
+            try {
+              const parsed = JSON.parse(eventData)
+              log.info(`[${id}] Parsed type: ${parsed.type}, keys: ${Object.keys(parsed).join(", ")}`)
+
+              // Codex API streaming format: response.output_text.delta
+              if (parsed.type === "response.output_text.delta" && parsed.delta) {
+                fullText += parsed.delta
+                log.info(`[${id}] Extracted delta: ${parsed.delta}`)
+              }
+
+              // Codex API completed format: response.output_item.done with full text
+              if (parsed.type === "response.output_item.done" && parsed.item?.content) {
+                for (const content of parsed.item.content) {
+                  if (content.type === "output_text" && content.text) {
+                    fullText = content.text // Use full text from completion
+                    log.info(`[${id}] Extracted full text: ${content.text.slice(0, 50)}...`)
+                  }
+                }
+              }
+
+              // Fallback: old Codex format with output array
+              if (parsed.output) {
+                for (const out of parsed.output) {
+                  if (out.content) {
+                    for (const content of out.content) {
+                      if (content.type === "output_text" && content.text) {
+                        fullText += content.text
+                        log.info(`[${id}] Extracted from output: ${content.text.slice(0, 50)}...`)
+                      }
+                    }
+                  }
+                }
+              }
+            } catch (e) {
+              log.err(`[${id}] Parse error: ${e}`)
+            }
+          }
+        }
+      }
+
+      log.res(`[${id}] buffered response: ${fullText.length} chars`)
+
+      return c.json({
+        id: `chatcmpl-${id}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: body.model,
+        choices: [{
+          index: 0,
+          message: {
+            role: "assistant",
+            content: fullText,
+          },
+          finish_reason: "stop",
+        }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      })
+    }
+
+    let dataJson = cleanNullValues(await parseBody(response)) as Record<string, any>
+
+    // Transform Codex response to OpenAI format if needed
+    if (dataJson && typeof dataJson === "object" && !dataJson.choices && dataJson.output) {
+      const output = Array.isArray(dataJson.output) ? dataJson.output : [dataJson.output]
+      const text = output.map((o: any) => o.content?.map((c: any) => c.text || c.type === "output_text" ? c.text : "").join("")).join("")
+
+      dataJson = {
+        id: dataJson.id || `chatcmpl-${id}`,
+        object: "chat.completion",
+        created: dataJson.created || Math.floor(Date.now() / 1000),
+        model: body.model,
+        choices: [{
+          index: 0,
+          message: {
+            role: "assistant",
+            content: text,
+          },
+          finish_reason: dataJson.incomplete?.reason || "stop",
+        }],
+        usage: dataJson.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      }
+    }
+
     return c.json(dataJson)
   } catch (error) {
     log.err(`[${id}] fetch error: ${(error as Error).message || error}`)
@@ -437,6 +620,15 @@ app.post("/v1/completions", async (c) => {
 
 const port = parseInt(process.env.PORT || "4097")
 console.log(`Starting codex server on port ${port}...`)
+
+// Debug: show available auth keys at startup
+const debugStore = readAuth()
+console.log(`Available auth keys: ${Object.keys(debugStore).join(", ") || "none"}`)
+if (debugStore.openai) {
+  console.log(`OpenAI auth type: ${(debugStore.openai as Auth).type || "unknown"}`)
+  console.log(`OpenAI expires: ${(debugStore.openai as Auth).expires || "none"}`)
+  console.log(`OpenAI expired: ${(debugStore.openai as Auth).expires ? (debugStore.openai as Auth).expires < Date.now() : "unknown"}`)
+}
 
 serve({
   fetch: app.fetch,
