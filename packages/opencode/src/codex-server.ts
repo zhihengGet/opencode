@@ -8,10 +8,12 @@ import path from "path"
 
 const R = "\x1b[31m"
 const G = "\x1b[32m"
+const Y = "\x1b[33m"
 const B = "\x1b[36m"
 const X = "\x1b[0m"
 
 const log = {
+  req: (msg: string, ...args: unknown[]) => console.log(`${Y}[REQ]${X} ${msg}`, ...args),
   info: (msg: string, ...args: unknown[]) => console.log(`${B}${msg}${X}`, ...args),
   err: (msg: string, ...args: unknown[]) => console.log(`${R}${msg}${X}`, ...args),
   res: (msg: string, ...args: unknown[]) => console.log(`${G}${msg}${X}`, ...args),
@@ -241,8 +243,14 @@ app.post("/v1/chat/completions", async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>
   const model = modelName(body.model)
 
-  log.info(`\n[${id}] POST /v1/chat/completions model=${model}`)
-  log.info(`[${id}] Request body keys: ${Object.keys(body).join(", ")}`)
+  log.req(`[${id}] POST /v1/chat/completions model=${model}`)
+  log.info(`[${id}] Request: ${JSON.stringify({
+    model: body.model,
+    messages: Array.isArray(body.messages) ? body.messages.length : 0,
+    tools: Array.isArray(body.tools) ? body.tools.length : 0,
+    response_format: body.response_format,
+    stream: body.stream,
+  })}`)
 
   if (!allowed(model)) {
     log.err(`[${id}] model not allowed: ${model}`)
@@ -285,9 +293,19 @@ app.post("/v1/chat/completions", async (c) => {
     const systemMsg = msgs.find((m: any) => m?.role === "system")
     const otherMsgs = msgs.filter((m: any) => m?.role !== "system")
 
+    // Check if JSON mode is requested
+    const isJsonMode = body.response_format && 
+      typeof body.response_format === "object" && 
+      (body.response_format as {type?: string}).type === "json_object"
+
+    let instructions = systemMsg?.content || "You are a helpful assistant."
+    if (isJsonMode && !instructions.toLowerCase().includes("json")) {
+      instructions += " Respond with valid JSON."
+    }
+
     codexBody = {
       model: body.model,
-      instructions: systemMsg?.content || "You are a helpful assistant.",
+      instructions,
       input: otherMsgs.length > 0 ? otherMsgs : [{ role: "user", content: "" }],
       store: false,
       stream: body.stream !== false,
@@ -296,7 +314,7 @@ app.post("/v1/chat/completions", async (c) => {
     // Pass through other options
     if (body.tools) codexBody.tools = body.tools
     if (body.tool_choice) codexBody.tool_choice = body.tool_choice
-    if (body.response_format) codexBody.response_format = body.response_format
+    // Note: response_format is not supported by Codex API, but we handle JSON mode via instructions
     if (body.temperature !== undefined) codexBody.temperature = body.temperature
     if (body.max_tokens !== undefined) codexBody.max_completion_tokens = body.max_tokens
     if (body.top_p !== undefined) codexBody.top_p = body.top_p
@@ -409,6 +427,8 @@ app.post("/v1/chat/completions", async (c) => {
       const decoder = new TextDecoder()
       let buffer = ""
       let fullText = ""
+      const toolCalls: Array<{id: string, type: string, function: {name: string, arguments: string}}> = []
+      const toolCallArgs: Record<string, string> = {}
 
       while (true) {
         const { done, value } = await reader.read()
@@ -443,6 +463,31 @@ app.post("/v1/chat/completions", async (c) => {
                 }
               }
 
+              // Accumulate function call argument deltas
+              if (parsed.type === "response.function_call_arguments.delta" && parsed.delta && parsed.item_id) {
+                toolCallArgs[parsed.item_id] = (toolCallArgs[parsed.item_id] || "") + parsed.delta
+              }
+
+              // Function call arguments complete
+              if (parsed.type === "response.function_call_arguments.done" && parsed.arguments && parsed.item_id) {
+                toolCallArgs[parsed.item_id] = parsed.arguments
+                log.info(`[${id}] Tool call arguments complete for ${parsed.item_id}: ${parsed.arguments.slice(0, 50)}...`)
+              }
+
+              // Codex API tool call format
+              if (parsed.type === "response.output_item.done" && parsed.item?.type === "function_call") {
+                const itemId = parsed.item.id
+                toolCalls.push({
+                  id: itemId,
+                  type: "function",
+                  function: {
+                    name: parsed.item.name,
+                    arguments: toolCallArgs[itemId] || "{}",
+                  },
+                })
+                log.info(`[${id}] Extracted tool call: ${parsed.item.name} with args: ${toolCallArgs[itemId]?.slice(0, 50) || "{}"}`)
+              }
+
               // Fallback: old Codex format with output array
               if (parsed.output) {
                 for (const out of parsed.output) {
@@ -463,7 +508,15 @@ app.post("/v1/chat/completions", async (c) => {
         }
       }
 
-      log.res(`[${id}] buffered response: ${fullText.length} chars`)
+      log.res(`[${id}] buffered response: ${fullText.length} chars, ${toolCalls.length} tool calls`)
+
+      const message: Record<string, any> = {
+        role: "assistant",
+        content: fullText,
+      }
+      if (toolCalls.length > 0) {
+        message.tool_calls = toolCalls
+      }
 
       return c.json({
         id: `chatcmpl-${id}`,
@@ -472,11 +525,8 @@ app.post("/v1/chat/completions", async (c) => {
         model: body.model,
         choices: [{
           index: 0,
-          message: {
-            role: "assistant",
-            content: fullText,
-          },
-          finish_reason: "stop",
+          message,
+          finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop",
         }],
         usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
       })
