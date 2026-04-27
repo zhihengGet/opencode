@@ -43,6 +43,30 @@ const models = [
   "gpt-5.4-mini",
 ] as const
 
+// Cost per 1M tokens from models.dev API (openai provider)
+const modelCosts: Record<string, { input: number; output: number }> = {
+  "gpt-5.1-codex": { input: 1.25, output: 10 },
+  "gpt-5.1-codex-max": { input: 1.25, output: 10 },
+  "gpt-5.1-codex-mini": { input: 0.25, output: 2 },
+  "gpt-5.2": { input: 1.75, output: 14 },
+  "gpt-5.2-codex": { input: 0.14, output: 1.14 },
+  "gpt-5.3-codex": { input: 1.25, output: 10 },
+  "gpt-5.3-codex-spark": { input: 1.25, output: 10 },
+  "gpt-5.4": { input: 1.25, output: 10 },
+  "gpt-5.4-mini": { input: 0.75, output: 4.5 },
+  "gpt-5.4-nano": { input: 0.2, output: 1.25 },
+}
+
+function estimateCost(model: string, inputChars: number, outputChars: number): number {
+  const costs = modelCosts[model] || { input: 1.25, output: 10 }
+  // Rough estimate: 4 chars per token
+  const inputTokens = Math.ceil(inputChars / 4)
+  const outputTokens = Math.ceil(outputChars / 4)
+  // Price is per 1M tokens
+  const cost = (inputTokens / 1_000_000) * costs.input + (outputTokens / 1_000_000) * costs.output
+  return cost
+}
+
 type Auth = {
   type: "oauth"
   refresh: string
@@ -263,13 +287,9 @@ app.post("/v1/chat/completions", async (c) => {
     return c.json(authMissing(), 401)
   }
 
-  const format = body.response_format
-  if (
-    typeof format === "object" &&
-    format !== null &&
-    (format as { type?: unknown }).type === "json_object" &&
-    Array.isArray(body.messages)
-  ) {
+  const format = body.response_format as { type?: string } | undefined
+  const isJsonFormat = format?.type === "json_object" || format?.type === "json_schema"
+  if (isJsonFormat && Array.isArray(body.messages)) {
     const hasJson = body.messages.some((item: unknown) => {
       if (typeof item !== "object" || item === null) return false
       const content = (item as Record<string, unknown>).content
@@ -294,13 +314,14 @@ app.post("/v1/chat/completions", async (c) => {
     const otherMsgs = msgs.filter((m: any) => m?.role !== "system")
 
     // Check if JSON mode is requested
-    const isJsonMode = body.response_format && 
-      typeof body.response_format === "object" && 
-      (body.response_format as {type?: string}).type === "json_object"
+    const format = body.response_format as { type?: string; json_schema?: { schema: unknown; name?: string; description?: string } } | undefined
+    const isJsonObject = format?.type === "json_object"
+    const isJsonSchema = format?.type === "json_schema" && format.json_schema?.schema
 
     let instructions = systemMsg?.content || "You are a helpful assistant."
-    if (isJsonMode && !instructions.toLowerCase().includes("json")) {
-      instructions += " Respond with valid JSON."
+    // For json_object mode, add instructions to request clean JSON (no markdown)
+    if (isJsonObject && !instructions.toLowerCase().includes("json")) {
+      instructions += " Respond with valid JSON only. Do not wrap in markdown code blocks."
     }
 
     codexBody = {
@@ -311,10 +332,44 @@ app.post("/v1/chat/completions", async (c) => {
       stream: body.stream !== false,
     }
 
+    // Use Codex Responses API text.format for structured output (instead of response_format)
+    if (isJsonSchema && format?.json_schema) {
+      // Codex requires additionalProperties: false on ALL object schemas
+      const schema = JSON.parse(JSON.stringify(format.json_schema.schema)) as Record<string, unknown>
+      const addAdditionalProperties = (obj: unknown): unknown => {
+        if (typeof obj !== "object" || obj === null) return obj
+        if (Array.isArray(obj)) return obj.map(addAdditionalProperties)
+        const result = { ...obj } as Record<string, unknown>
+        if (result.type === "object") {
+          result.additionalProperties = false
+        }
+        // Recurse into each property value
+        if (result.properties) {
+          const props = result.properties as Record<string, unknown>
+          for (const key of Object.keys(props)) {
+            props[key] = addAdditionalProperties(props[key])
+          }
+        }
+        // Recurse into items
+        if (result.items) {
+          result.items = addAdditionalProperties(result.items)
+        }
+        return result
+      }
+      const fixedSchema = addAdditionalProperties(schema) as Record<string, unknown>
+      codexBody.text = {
+        format: {
+          type: "json_schema",
+          schema: fixedSchema,
+          name: format.json_schema.name || "response",
+          ...(format.json_schema.description ? { description: format.json_schema.description } : {}),
+        },
+      }
+    }
+
     // Pass through other options
     if (body.tools) codexBody.tools = body.tools
     if (body.tool_choice) codexBody.tool_choice = body.tool_choice
-    // Note: response_format is not supported by Codex API, but we handle JSON mode via instructions
     if (body.temperature !== undefined) codexBody.temperature = body.temperature
     if (body.max_tokens !== undefined) codexBody.max_completion_tokens = body.max_tokens
     if (body.top_p !== undefined) codexBody.top_p = body.top_p
@@ -353,6 +408,7 @@ app.post("/v1/chat/completions", async (c) => {
       const decoder = new TextDecoder()
       let buffer = ""
       let chunkCount = 0
+      let outputChars = 0
 
       c.header("Content-Type", "text/event-stream")
       c.header("Cache-Control", "no-cache")
@@ -364,10 +420,15 @@ app.post("/v1/chat/completions", async (c) => {
             // Start reading in background
             const pump = async () => {
               try {
+                // Estimate input cost for streaming
+                const inputText = JSON.stringify(body.input || body.messages || "")
+                const inputChars = inputText.length
+                
                 while (true) {
                   const { done, value } = await reader.read()
                   if (done) {
-                    log.res(`[${id}] stream complete (${chunkCount} chunks)`)
+                    const estimatedCost = estimateCost(model, inputChars, outputChars)
+                    log.res(`[${id}] stream complete (${chunkCount} chunks, ${outputChars} chars, est. $${estimatedCost.toFixed(6)})`)
                     controller.close()
                     return
                   }
@@ -401,6 +462,7 @@ app.post("/v1/chat/completions", async (c) => {
                           const sse = `data: ${JSON.stringify(openaiChunk)}\n\n`
                           controller.enqueue(new TextEncoder().encode(sse))
                           chunkCount++
+                          outputChars += parsed.delta.length
                         }
                       } catch {}
                     }
@@ -508,7 +570,13 @@ app.post("/v1/chat/completions", async (c) => {
         }
       }
 
-      log.res(`[${id}] buffered response: ${fullText.length} chars, ${toolCalls.length} tool calls`)
+      // Estimate tokens from character counts (rough approximation)
+      const inputText = JSON.stringify(body.input || body.messages || "")
+      const inputChars = inputText.length
+      const outputChars = fullText.length
+      const estimatedCost = estimateCost(model, inputChars, outputChars)
+      
+      log.res(`[${id}] buffered response: ${fullText.length} chars, ${toolCalls.length} tool calls, est. $${estimatedCost.toFixed(6)}`)
 
       const message: Record<string, any> = {
         role: "assistant",
@@ -528,7 +596,12 @@ app.post("/v1/chat/completions", async (c) => {
           message,
           finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop",
         }],
-        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        usage: { 
+          prompt_tokens: Math.ceil(inputChars / 4), 
+          completion_tokens: Math.ceil(outputChars / 4), 
+          total_tokens: Math.ceil((inputChars + outputChars) / 4),
+          estimated_cost_usd: estimatedCost.toFixed(6),
+        },
       })
     }
 
